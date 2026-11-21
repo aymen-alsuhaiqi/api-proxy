@@ -1,50 +1,67 @@
 # API Proxy Service
 
-A dynamic HTTP API Proxy endpoint built with Django that relays requests to arbitrary upstream URLs and returns their response directly, supporting dynamic, unstructured, and random schemas without requiring predefined models or serialization constraints.
+A Django API gateway that forwards requests to registered upstream domains. You register **domains** (base URL + credentials) and their **endpoints** (path + HTTP method). A request to `/api/proxy/<path>` is matched against the registered endpoints, sent to the matching domain with its credentials attached, and the upstream response is returned as-is.
 
-## Endpoint
-
-- **Primary URL**: `/api/proxy/`
-- **Alias URL**: `/api/gateway/`
-- **Supported Methods**: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, etc.
-
----
-
-## Usage Examples
-
-### 1. Simple GET Request via Query Parameter
-Call any target URL via the `?url=` parameter:
+## Setup
 
 ```bash
-curl -X GET "http://127.0.0.1:8000/api/proxy/?url=https://api.github.com/zen"
+pip install -r requirements.txt
+python manage.py migrate
+python manage.py createsuperuser
+python manage.py runserver
 ```
 
-### 2. POST / Custom Request with Payload via JSON Body
-Send a JSON payload specifying the target URL, method, headers, and body data:
+Then open `http://127.0.0.1:8000/admin/` to add domains and endpoints.
+
+## Configuration
+
+### Domain
+| Field | Description |
+|---|---|
+| `name` | Unique label, e.g. `github` |
+| `base_url` | Upstream base URL, e.g. `https://api.github.com` |
+| `is_active` | Disable to stop proxying all of the domain's endpoints |
+| `timeout` | Upstream timeout in seconds (default 30) |
+| `auth_type` | `none`, `bearer`, `basic`, `api_key_header`, `api_key_query` |
+| `token` | Used by `bearer` → `Authorization: Bearer <token>` |
+| `username` / `password` | Used by `basic` |
+| `api_key_name` / `api_key_value` | Used by `api_key_header` (header name) and `api_key_query` (query param name) |
+| `extra_headers` | JSON object of headers sent with every request |
+
+### Endpoint
+| Field | Description |
+|---|---|
+| `domain` | The domain this endpoint belongs to |
+| `path` | Path after `/api/proxy/`, e.g. `/zen`. Placeholders match one path segment: `/users/{username}/repos` |
+| `method` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS` |
+| `is_active` | Disable to stop proxying this endpoint |
+
+A `path` + `method` pair is unique across all domains. Exact paths take priority over placeholder paths.
+
+## Usage
+
+With a domain `https://api.github.com` and an endpoint `GET /zen`:
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/api/proxy/" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://httpbin.org/post",
-    "method": "POST",
-    "headers": {
-      "Authorization": "Bearer sample_token"
-    },
-    "data": {
-      "any_random_key": "any_value",
-      "nested_list": [1, 2, 3]
-    }
-  }'
+curl "http://127.0.0.1:8000/api/proxy/zen"
+# -> GET https://api.github.com/zen (with the domain's credentials)
 ```
 
-### 3. Dynamic Response Schema
-Whatever the upstream server returns (arbitrary JSON schema, array of objects, XML, plain text, HTML, binary stream), the proxy returns it directly with:
-- The exact **HTTP status code** from the upstream server (e.g. `200`, `201`, `400`, `404`, etc.)
-- The original **Content-Type** header
-- Raw payload without enforcing static schemas
+- Query strings are forwarded: `/api/proxy/search?q=x` → `<base_url>/search?q=x`
+- The request body and `Content-Type` are forwarded unchanged.
+- Client headers are forwarded, but the domain's credentials and `extra_headers` override them.
+- The upstream status code, `Content-Type`, headers and body are returned unchanged.
 
-### 4. Error Handling
-- **400 Bad Request**: If `url` is missing or has an invalid scheme (only HTTP/HTTPS allowed).
-- **502 Bad Gateway**: If the upstream host is unreachable or DNS lookup fails.
-- **504 Gateway Timeout**: If the upstream request times out.
+## Error responses
+| Status | When |
+|---|---|
+| `404` | No active endpoint is registered for the path |
+| `405` | The path exists but not for this method (`Allow` header lists valid methods) |
+| `502` | Upstream unreachable / DNS failure |
+| `504` | Upstream timed out |
+
+## Tests
+
+```bash
+python manage.py test api_proxy
+```
