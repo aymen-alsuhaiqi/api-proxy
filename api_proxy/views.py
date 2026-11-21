@@ -1,8 +1,8 @@
-import json
-from urllib.parse import urlparse
 import httpx
 from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+
+from .models import Endpoint, normalize_path
 
 HOP_BY_HOP_HEADERS = {
     'connection',
@@ -18,107 +18,76 @@ HOP_BY_HOP_HEADERS = {
     'host',
 }
 
+# Not forwarded upstream: httpx advertises only the encodings it can decode.
+# Passing the client's (e.g. "gzip, deflate, br") through can get a body httpx
+# can't decompress, which we'd then return as garbage without Content-Encoding.
+REQUEST_EXCLUDED_HEADERS = HOP_BY_HOP_HEADERS | {'accept-encoding'}
+
+
+def resolve_endpoint(path, method):
+    """
+    Find the active endpoint registered for this path + method.
+    Returns (endpoint, allowed_methods); endpoint is None when nothing matches.
+    """
+    candidates = Endpoint.objects.select_related('domain').filter(
+        is_active=True, domain__is_active=True,
+    )
+    matching = [e for e in candidates if e.matches(path)]
+    # Prefer exact (static) paths over placeholder paths like /users/{id}
+    matching.sort(key=lambda e: e.is_dynamic)
+    for endpoint in matching:
+        if endpoint.method == method:
+            return endpoint, []
+    return None, sorted({e.method for e in matching})
+
+
 @csrf_exempt
-def proxy_view(request):
+def proxy_view(request, subpath=''):
     """
-    Dynamic API Proxy endpoint.
-    Accepts target URL via query param (?url=...) or JSON request body {"url": "..."}.
-    Forwards request to the destination URL and returns the upstream response
-    preserving status code, content-type, and dynamic/unstructured payload.
+    Path-based API proxy.
+    /api/proxy/<path> is looked up against the registered endpoints; the request
+    is forwarded to the endpoint's domain with the domain's credentials attached,
+    and the upstream response is returned as-is.
     """
-    target_url = request.GET.get('url')
-    method = request.method
-    headers = {}
-    params = {}
-    data = None
-    json_data = None
+    path = normalize_path(subpath)
+    method = request.method.upper()
 
-    # Check if request has JSON payload with config/data
-    if request.content_type == 'application/json' and request.body:
-        try:
-            body_json = json.loads(request.body.decode('utf-8'))
-            if isinstance(body_json, dict):
-                # If 'url' is provided in JSON body
-                if not target_url and 'url' in body_json:
-                    target_url = body_json.get('url')
-                
-                # Check for wrapped schema: {"url": "...", "method": "...", "headers": {}, "params": {}, "data": ...}
-                if 'method' in body_json:
-                    method = str(body_json['method']).upper()
-                if 'headers' in body_json and isinstance(body_json['headers'], dict):
-                    headers.update(body_json['headers'])
-                if 'params' in body_json and isinstance(body_json['params'], dict):
-                    params.update(body_json['params'])
-                
-                if 'json' in body_json:
-                    json_data = body_json['json']
-                elif 'data' in body_json:
-                    if isinstance(body_json['data'], (dict, list)):
-                        json_data = body_json['data']
-                    else:
-                        data = str(body_json['data']).encode('utf-8')
-                elif 'url' in body_json and len(body_json) == 1:
-                    # Only {"url": "..."} was provided
-                    pass
-                elif 'url' not in body_json:
-                    # Treat entire body as payload to forward
-                    json_data = body_json
-            else:
-                json_data = body_json
-        except json.JSONDecodeError:
-            data = request.body
-    elif request.body:
-        data = request.body
+    endpoint, allowed = resolve_endpoint(path, method)
+    if endpoint is None:
+        if allowed:
+            response = JsonResponse(
+                {'error': f'Method {method} is not allowed for {path}.', 'allowed_methods': allowed},
+                status=405,
+            )
+            response['Allow'] = ', '.join(allowed)
+            return response
+        return JsonResponse({'error': f'No endpoint registered for {path}.'}, status=404)
 
-    # Fallback to POST form data if url is there
-    if not target_url and request.POST.get('url'):
-        target_url = request.POST.get('url')
+    domain = endpoint.domain
+    auth_headers = domain.auth_headers()
+    overridden = {k.lower() for k in auth_headers}
 
-    if not target_url:
-        return JsonResponse(
-            {
-                'error': 'Target URL is required.',
-                'usage': {
-                    'query_param': '/api/proxy/?url=https://api.example.com/data',
-                    'json_body': {
-                        'url': 'https://api.example.com/data',
-                        'method': 'GET or POST (optional)',
-                        'headers': {'Custom-Header': 'value (optional)'},
-                        'params': {'key': 'value (optional)'},
-                        'data': 'payload (optional)'
-                    }
-                }
-            },
-            status=400
-        )
+    # Forward client headers, letting the domain's credentials/extra headers win
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in REQUEST_EXCLUDED_HEADERS and k.lower() not in overridden
+    }
+    headers.update(auth_headers)
 
-    # Validate URL structure
-    parsed_url = urlparse(target_url)
-    if not parsed_url.scheme or parsed_url.scheme not in ('http', 'https') or not parsed_url.netloc:
-        return JsonResponse(
-            {'error': f'Invalid URL scheme "{parsed_url.scheme}". Only HTTP and HTTPS are supported.'},
-            status=400
-        )
-
-    # Forward any non-hop-by-hop headers from client if not already overridden
-    for k, v in request.headers.items():
-        k_lower = k.lower()
-        if k_lower not in HOP_BY_HOP_HEADERS and k not in headers:
-            headers[k] = v
+    params = [(k, v) for k, values in request.GET.lists() for v in values]
+    params.extend(domain.auth_params().items())
 
     try:
-        # Perform upstream request
-        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=domain.timeout, follow_redirects=True) as client:
             upstream_response = client.request(
                 method=method,
-                url=target_url,
-                params=params if params else None,
+                url=domain.build_url(path),
+                params=params or None,
                 headers=headers,
-                content=data if json_data is None else None,
-                json=json_data,
+                content=request.body or None,
+                auth=domain.basic_auth(),
             )
 
-        # Build downstream response
         content_type = upstream_response.headers.get('content-type', 'application/json')
         response = HttpResponse(
             content=upstream_response.content,
@@ -148,6 +117,3 @@ def proxy_view(request):
             {'error': 'Proxy internal server error.', 'details': str(exc)},
             status=500
         )
-
-# Backward-compatibility alias
-gateway_view = proxy_view
